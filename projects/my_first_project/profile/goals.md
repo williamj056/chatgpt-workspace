@@ -1,0 +1,2 @@
+- Set up SSD logging and project memory
+- Daily scripting practice

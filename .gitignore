@@ -1,0 +1,15 @@
+# Never commit secrets
+.openai_key
+*.env
+
+# Logs (generated content)
+logs/
+projects/*/logs/
+
+# Junk
+*.swp
+*.tmp
+.DS_Store
+
+# Optional: system trash
+.Trash-*

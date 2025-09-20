@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# searchgpt — fast search over ChatGPT logs & projects on SSD
+# Usage:
+#   searchgpt "query"
+#   searchgpt -p myproject "query"
+#   searchgpt --since 14 "query"         # only last 14 days
+#   searchgpt --fzf "query"               # interactive picker (fzf)
+#   searchgpt --open "query"              # open top hit in $PAGER (or less)
+#   searchgpt --list                      # list files indexed (no query)
+#
+# Depends: ripgrep (rg). Optional: fzf, bat or glow for pretty preview.
+# Install: sudo apt install -y ripgrep fzf bat
+
+set -euo pipefail
+
+SSD_ROOT="/mnt/ssd/ChatGPT"
+LOG_DIR="$SSD_ROOT/logs"
+PROJ_DIR="$SSD_ROOT/projects"
+
+# --- defaults
+QUERY=""
+PROJECT=""
+SINCE_DAYS=""
+USE_FZF=""
+OPEN_TOP=""
+LIST_ONLY=""
+
+# --- tools
+RG_BIN="${RG_BIN:-rg}"
+FZF_BIN="${FZF_BIN:-fzf}"
+PAGER_BIN="${PAGER:-less}"
+BAT_BIN="${BAT_BIN:-bat}"
+GLOW_BIN="${GLOW_BIN:-glow}"  # optional markdown viewer
+
+# --- checks
+command -v "$RG_BIN" >/dev/null 2>&1 || { echo "Error: ripgrep (rg) is required. Install with: sudo apt install -y ripgrep" >&2; exit 1; }
+[ -d "$SSD_ROOT" ] || { echo "Error: $SSD_ROOT not found/mounted." >&2; exit 1; }
+mkdir -p "$LOG_DIR" "$PROJ_DIR" >/dev/null 2>&1 || true
+
+# --- args
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    -p|--project) PROJECT="${2:-}"; shift 2;;
+    --since) SINCE_DAYS="${2:-}"; shift 2;;
+    --fzf) USE_FZF=1; shift;;
+    --open) OPEN_TOP=1; shift;;
+    --list) LIST_ONLY=1; shift;;
+    --) shift; break;;
+    -*) echo "Unknown option: $1" >&2; exit 1;;
+    *) QUERY="$*"; break;;
+  esac
+done
+
+# --- target set
+TARGETS=()
+if [ -n "$PROJECT" ]; then
+  # slugify project name (aligns with askgpt scripts)
+  P_SLUG="$(echo "$PROJECT" | tr '[:upper:]' '[:lower:]' | sed 's/ /_/g' | tr -cd '[:alnum:]_.-')"
+  [ -z "$P_SLUG" ] && P_SLUG="project"
+  P_DIR="$PROJ_DIR/$P_SLUG"
+  if [ -d "$P_DIR" ]; then
+    TARGETS+=("$P_DIR")
+  else
+    echo "Warning: project folder not found: $P_DIR" >&2
+  fi
+else
+  TARGETS+=("$LOG_DIR" "$PROJ_DIR")
+fi
+
+# --- list-only mode
+if [ -n "$LIST_ONLY" ]; then
+  echo "# Indexed locations:"
+  for t in "${TARGETS[@]}"; do
+    echo "$t"
+  done
+  echo
+  echo "# Latest files:"
+  ls -1t "${TARGETS[@]}" 2>/dev/null | head -n 50 || true
+  exit 0
+fi
+
+# --- time filter
+RG_TIME_ARGS=()
+if [ -n "$SINCE_DAYS" ]; then
+  # ripgrep doesn't do mtime filters directly; we filter file list with find
+  TMP_FILES="$(mktemp)"
+  trap 'rm -f "$TMP_FILES"' EXIT
+  # collect candidate files newer than SINCE_DAYS
+  for t in "${TARGETS[@]}"; do
+    [ -d "$t" ] || continue
+    find "$t" -type f -name '*.md' -mtime "-$SINCE_DAYS" -print >> "$TMP_FILES" || true
+  done
+  if [ ! -s "$TMP_FILES" ]; then
+    echo "No files in the last $SINCE_DAYS days." >&2
+    exit 0
+  fi
+  FILESET=( $(cat "$TMP_FILES") )
+else
+  # all markdown files under targets
+  FILESET=()
+  for t in "${TARGETS[@]}"; do
+    [ -d "$t" ] || continue
+    while IFS= read -r f; do FILESET+=("$f"); done < <(find "$t" -type f -name '*.md' 2>/dev/null)
+  done
+fi
+
+if [ ${#FILESET[@]} -eq 0 ]; then
+  echo "No files to search in: ${TARGETS[*]}" >&2
+  exit 0
+fi
+
+# --- if no query, switch to fzf picker over files
+if [ -z "${QUERY:-}" ]; then
+  if [ -n "$USE_FZF" ] && command -v "$FZF_BIN" >/dev/null 2>&1; then
+    # preview with bat/glow if available
+    if command -v "$BAT_BIN" >/dev/null 2>&1; then
+      PREVIEW_CMD="$BAT_BIN --style=plain --paging=never --color=always {}"
+    elif command -v "$GLOW_BIN" >/dev/null 2>&1; then
+      PREVIEW_CMD="$GLOW_BIN -s dark {}"
+    else
+      PREVIEW_CMD="sed -n '1,200p' {}"
+    fi
+    SEL="$(printf '%s\n' "${FILESET[@]}" | "$FZF_BIN" --preview "$PREVIEW_CMD" --bind 'enter:execute('$PAGER_BIN' {})+abort' || true)"
+    [ -n "$SEL" ] && exec "$PAGER_BIN" "$SEL" || exit 0
+  else
+    # just list
+    printf '%s\n' "${FILESET[@]}"
+    exit 0
+  fi
+fi
+
+# --- run ripgrep search
+# Use smart-case, show line numbers, and a bit of context
+RG_ARGS=(--smart-case --line-number --color=never -n)
+# show 2 lines of context around matches
+RG_ARGS+=( -C 2 )
+
+# Execute search
+RESULTS="$("$RG_BIN" "${RG_ARGS[@]}" -- "$QUERY" "${FILESET[@]}" || true)"
+
+if [ -z "$RESULTS" ]; then
+  echo "No matches for: $QUERY" >&2
+  exit 0
+fi
+
+# --- interactive picker if requested
+if [ -n "$USE_FZF" ] && command -v "$FZF_BIN" >/dev/null 2>&1; then
+  # fzf with a preview that jumps to line
+  PREVIEW_SH='
+    file=$(echo {} | cut -d: -f1);
+    line=$(echo {} | cut -d: -f2);
+    if command -v bat >/dev/null 2>&1; then
+      bat --style=plain --color=always --line-range $((line>5?line-5:1)):$((line+20)) "$file"
+    elif command -v glow >/dev/null 2>&1; then
+      glow -s dark "$file"
+    else
+      nl -ba "$file" | sed -n "$((line>5?line-5:1)),$((line+20))p"
+    fi
+  '
+  SEL_LINE="$(printf '%s\n' "$RESULTS" | "$FZF_BIN" --ansi --no-sort --tac --preview "$PREVIEW_SH" || true)"
+  if [ -n "$SEL_LINE" ]; then
+    SEL_FILE="$(echo "$SEL_LINE" | cut -d: -f1)"
+    SEL_LNUM="$(echo "$SEL_LINE" | cut -d: -f2)"
+    # open at line (less +N)
+    exec "$PAGER_BIN" +${SEL_LNUM} "$SEL_FILE"
+  fi
+  exit 0
+fi
+
+# --- open top hit if requested
+if [ -n "$OPEN_TOP" ]; then
+  TOP_LINE="$(printf '%s\n' "$RESULTS" | head -n 1)"
+  TOP_FILE="$(echo "$TOP_LINE" | cut -d: -f1)"
+  TOP_LNUM="$(echo "$TOP_LINE" | cut -d: -f2)"
+  exec "$PAGER_BIN" +${TOP_LNUM} "$TOP_FILE"
+fi
+
+# --- default: print results
+printf '%s\n' "$RESULTS"

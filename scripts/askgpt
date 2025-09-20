@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# askgpt — ChatGPT terminal helper with SSD logging & optional per-project logs
+# Usage:
+#   askgpt "your question"
+#   askgpt -f path/to/file.txt
+#   askgpt -p myproject "question for that project"
+#   askgpt --no-log "one-off question (no log saved)"
+# Env (optional):
+#   MODEL=gpt-4o        TEMP=0.3       MAX_DAYS=30
+
+set -euo pipefail
+
+# -------- Config --------------------------------------------------------------
+SSD_ROOT="/mnt/ssd/ChatGPT"      # where logs/projects live (SSD)
+LOG_DIR="$SSD_ROOT/logs"
+PROJ_DIR="$SSD_ROOT/projects"
+
+MODEL="${MODEL:-gpt-4o-mini}"    # override per-call: MODEL=gpt-4o askgpt "..."
+TEMP="${TEMP:-0.7}"              # creativity; lower = more direct
+MAX_DAYS="${MAX_DAYS:-30}"       # rotate logs older than N days (0=off)
+# -----------------------------------------------------------------------------
+
+# --- Load API key from ~/.openai_key (secure) --------------------------------
+if [ -f "$HOME/.openai_key" ]; then
+  OPENAI_API_KEY="$(cat "$HOME/.openai_key")"
+else
+  echo "Error: ~/.openai_key not found. Put your API key there and: chmod 600 ~/.openai_key" >&2
+  exit 1
+fi
+
+# --- Require jq ---------------------------------------------------------------
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: 'jq' is required. Install it with: sudo apt install -y jq" >&2
+  exit 1
+fi
+
+# --- Ensure SSD dirs exist & writable (NO FALLBACK) ---------------------------
+mkdir -p "$LOG_DIR" "$PROJ_DIR" || { echo "Error: cannot create $LOG_DIR / $PROJ_DIR" >&2; exit 1; }
+[ -w "$LOG_DIR" ]  || { echo "Error: $LOG_DIR is not writable"  >&2; exit 1; }
+[ -w "$PROJ_DIR" ] || { echo "Error: $PROJ_DIR is not writable" >&2; exit 1; }
+
+# --- Parse flags --------------------------------------------------------------
+PROJECT=""
+FILEMODE=""
+FILEPATH=""
+NO_LOG=""
+
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    -f)
+      FILEMODE="1"
+      FILEPATH="${2:-}"
+      [ -n "$FILEPATH" ] || { echo "Error: -f requires a file path" >&2; exit 1; }
+      shift 2
+      ;;
+    -p|--project)
+      PROJECT="${2:-}"
+      [ -n "$PROJECT" ] || { echo "Error: -p|--project requires a name" >&2; exit 1; }
+      shift 2
+      ;;
+    --no-log)
+      NO_LOG="1"
+      shift
+      ;;
+    --)
+      shift; break;;
+    -*)
+      echo "Unknown option: $1" >&2; exit 1;;
+    *)
+      break;;
+  esac
+done
+
+# --- Build query --------------------------------------------------------------
+if [ -n "${FILEMODE:-}" ]; then
+  [ -f "$FILEPATH" ] || { echo "Error: file '$FILEPATH' not found" >&2; exit 1; }
+  QUERY="$(cat "$FILEPATH")"
+  # If extra args after -f <file>, append as context
+  if [ $# -gt 0 ]; then
+    QUERY="$QUERY"$'\n\n'"Additional context: $*"
+  fi
+else
+  QUERY="${*:-}"
+fi
+
+[ -n "$QUERY" ] || {
+  echo "Usage:" >&2
+  echo "  askgpt \"your question\"" >&2
+  echo "  askgpt -f file.txt [extra context...]" >&2
+  echo "  askgpt -p project \"question for project\"" >&2
+  echo "  askgpt --no-log \"question without saving a log\"" >&2
+  exit 1
+}
+
+# --- JSON payload (safely escapd) -------------------------------------------
+PAYLOAD="$(jq -n --arg content "$QUERY" --arg model "$MODEL" --argjson temp "$TEMP" '
+  { model: $model, messages: [ { role:"user", content:$content } ], temperature: $temp }
+')"
+
+# --- Send request & capture HTTP code ----------------------------------------
+RESP="$(
+  curl -sS -w '\n%{http_code}' \
+    https://api.openai.com/v1/chat/completions \
+    -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD"
+)"
+
+BODY="$(printf '%s' "$RESP" | sed '$d')"
+CODE="$(printf '%s' "$RESP" | tail -n1)"
+
+if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 300 ]; then
+  echo "HTTP error $CODE" >&2
+  if echo "$BODY" | jq -e '.error' >/dev/null 2>&1; then
+    echo "$BODY" | jq -r '.error.message' >&2
+  else
+    echo "$BODY" >&2
+  fi
+  exit 1
+fi
+
+CONTENT="$(echo "$BODY" | jq -r 'try .choices[0].message.content // empty')"
+if [ -z "$CONTENT" ]; then
+  echo "Note: empty .choices[0].message.content; raw response:" >&2
+  echo "$BODY"
+  exit 0
+fi
+
+# --- Print answer to terminal -------------------------------------------------
+printf '%s\n' "$CONTENT"
+
+# --- Logging ------------------------------------------------------------------
+if [ -z "$NO_LOG" ]; then
+  TS="$(date +'%Y-%m-%d_%H-%M-%S')"
+
+  # Slug from first line of question (allow alnum, dot, underscore, dash; then spaces->underscores)
+  FIRSTLINE="$(printf '%s' "$QUERY" | head -n1)"
+  QSLUG="$(echo "$FIRSTLINE" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]._-' | tr ' ' '_' | cut -c1-60)"
+  [ -z "$QSLUG" ] && QSLUG="chat"
+
+  MAIN_LOG="$LOG_DIR/chat_${TS}_${QSLUG}.md"
+
+  {
+    echo "## 🕒 $(date)"
+    [ -n "$PROJECT" ] && echo "**Project:** $PROJECT"
+    [ -n "${FILEMODE:-}" ] && echo "**Input file:** $FILEPATH"
+    echo
+    echo "**Q:**"
+    echo '```'
+    printf '%s\n' "$QUERY"
+    echo '```'
+    echo
+    echo "**A:**"
+    echo
+    printf '%s\n' "$CONTENT"
+    echo
+    echo '---'
+  } >> "$MAIN_LOG"
+
+  echo "Saved main log → $MAIN_LOG" >&2
+
+  # Optional project log (write directly, no copying)
+  if [ -n "$PROJECT" ]; then
+    # gentler slug for project: lower, spaces -> underscores, allow alnum _ . -
+    P_SLUG="$(echo "$PROJECT" | tr '[:upper:]' '[:lower:]' | sed 's/ /_/g' | tr -cd '[:alnum:]_.-')"
+    [ -z "$P_SLUG" ] && P_SLUG="project"
+
+    P_DIR="$PROJ_DIR/$P_SLUG"
+    mkdir -p "$P_DIR" || { echo "Warning: cannot create $P_DIR (check mount/permissions)" >&2; }
+    P_LOG="$P_DIR/${TS}_${QSLUG}.md"
+
+    {
+      echo "## 🕒 $(date)"
+      echo "**Project:** $PROJECT"
+      [ -n "${FILEMODE:-}" ] && echo "**Input file:** $FILEPATH"
+      echo
+      echo "**Q:**"
+      echo '```'
+      printf '%s\n' "$QUERY"
+      echo '```'
+      echo
+      echo "**A:**"
+      echo
+      printf '%s\n' "$CONTENT"
+      echo
+      echo '---'
+    } >> "$P_LOG" 2>/dev/null || true
+
+    [ -f "$P_LOG" ] && echo "Saved project log → $P_LOG" >&2
+  fi
+
+  # Rotate old logs if enabled
+  if [ "${MAX_DAYS:-0}" -gt 0 ] 2>/dev/null; then
+    find "$LOG_DIR" -type f -mtime +"$MAX_DAYS" -delete 2>/dev/null || true
+  fi
+fi
